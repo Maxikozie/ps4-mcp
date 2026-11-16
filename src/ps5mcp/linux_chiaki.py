@@ -53,19 +53,28 @@ AXIS_KEYS = {
 }
 
 
+# Xwayland authorization files the compositors leave in XDG_RUNTIME_DIR: GNOME's Mutter, then KDE's KWin.
+XWAYLAND_AUTH_PATTERNS = (".mutter-Xwaylandauth.*", "xauth_*")
+
+
+def _xwayland_auth(runtime: Path) -> Path | None:
+    """The newest Xwayland authorization file of this session, if a known compositor wrote one."""
+    files = [path for pattern in XWAYLAND_AUTH_PATTERNS for path in runtime.glob(pattern) if path.is_file()]
+    return max(files, key=lambda path: path.stat().st_mtime) if files else None
+
+
 def _display_environment() -> dict[str, str]:
     """Find this user's Xwayland endpoint when the agent shell lost session vars."""
     env = os.environ.copy()
     runtime = Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
-    # Agent-launched shells may not inherit DISPLAY/XAUTHORITY from GNOME.
-    # Mutter's auth file is a reliable sign that the standard Xwayland display
-    # is available, and avoids looking in /tmp for its socket.
-    if not env.get("DISPLAY") and any(runtime.glob(".mutter-Xwaylandauth.*")):
+    # Agent-launched shells may not inherit DISPLAY/XAUTHORITY from the desktop session.
+    # The compositor's Xwayland auth file (GNOME's Mutter or KDE's KWin) is a reliable sign
+    # that the standard Xwayland display is available, and avoids looking in /tmp for its socket.
+    auth = _xwayland_auth(runtime)
+    if not env.get("DISPLAY") and auth:
         env["DISPLAY"] = ":0"
-    if not env.get("XAUTHORITY"):
-        auth_files = sorted(runtime.glob(".mutter-Xwaylandauth.*"))
-        if auth_files:
-            env["XAUTHORITY"] = str(auth_files[-1])
+    if not env.get("XAUTHORITY") and auth:
+        env["XAUTHORITY"] = str(auth)
     env.setdefault("QT_QPA_PLATFORM", "xcb")
     return env
 
@@ -102,9 +111,15 @@ class LinuxChiakiApp:
     def _window(self) -> int:
         if not self.env.get("DISPLAY"):
             raise LinuxChiakiError("No X11/Xwayland display is available to this Linux session.")
-        result = _run(["xdotool", "search", "--onlyvisible", "--name", "chiaki-ng"], env=self.env)
-        ids = [line for line in result.stdout.decode(errors="replace").splitlines() if line.isdigit()]
-        if result.returncode or not ids:
+        ids: list[str] = []
+        # xdotool's --name reads WM_NAME. Under KDE's Xwayland the main window leaves WM_NAME empty and is named
+        # only through _NET_WM_NAME, so fall back to its WM_CLASS ("chiaki", "Chiaki").
+        for match in (["--name", "chiaki-ng"], ["--class", "^chiaki$"]):
+            result = _run(["xdotool", "search", "--onlyvisible", *match], env=self.env)
+            ids = [line for line in result.stdout.decode(errors="replace").splitlines() if line.isdigit()]
+            if not result.returncode and ids:
+                break
+        if not ids:
             raise LinuxChiakiError("Chiaki-ng has no visible window. Open the PS4 Remote Play session first.")
         # A stream pop-up may coexist with the host-list window. Use the largest visible window.
         windows: list[tuple[int, int]] = []
